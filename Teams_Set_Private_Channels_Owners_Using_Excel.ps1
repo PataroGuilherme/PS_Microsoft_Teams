@@ -12,6 +12,7 @@
 ############# FUNÇÕES
 # 1. Este código identifica o Owner listado > Confere se ele já é Owner no grupo Pai > Se for, o adiciona diretamente no Private Channel como Owner também. Se não, primeiro o adiciona no grupo pai como owner e depois no Private Channel.
 # 2. Todos os demais membros ficam intactos, da forma como já estavam.
+# 3. Este script não remove o Onwer do grupo pai (para evitar que ele seja quitado também de todos os demais canais privados).
 
 <#
 .SYNOPSIS
