@@ -158,9 +158,9 @@ function Get-ChannelCache {
 
 # --------------------------- Read input ---------------------------
 
-$rows = @(Import-Excel -Path $InputPath -WorksheetName "Sheet1")
+$rows = @(Import-Excel -Path $InputPath -WorksheetName "Channel Members")
 if ($rows.Count -eq 0) {
-    throw "The worksheet 'Sheet1' contains no data rows."
+    throw "The worksheet 'Channel Members' contains no data rows."
 }
 
 $requiredColumns = @(
