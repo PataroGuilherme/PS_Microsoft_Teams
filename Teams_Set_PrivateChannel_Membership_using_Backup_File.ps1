@@ -97,6 +97,36 @@ function Invoke-GraphPost {
     Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $json -ContentType "application/json" -OutputType PSObject
 }
 
+function Invoke-ChannelMemberPostWithRetry {
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [Parameter(Mandatory)][object]$Body,
+        [int]$MaxAttempts = 4
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            Invoke-GraphPost -Uri $Uri -Body $Body | Out-Null
+            return
+        }
+        catch {
+            $errorText = $_.Exception.Message
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $errorText += " " + $_.ErrorDetails.Message
+            }
+
+            $isRosterPropagationError = $errorText -match "UserNotFoundInTeamRoster|not part of the parent team roster"
+            if ($isRosterPropagationError -and $attempt -lt $MaxAttempts) {
+                Write-Host "  INFO - Team roster update is still propagating. Retrying channel addition ($attempt/$MaxAttempts)..." -ForegroundColor Yellow
+                Start-Sleep -Seconds 3
+                continue
+            }
+
+            throw
+        }
+    }
+}
+
 function New-IdSet {
     # Prevent PowerShell from enumerating an empty HashSet into $null.
     return ,([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
@@ -115,17 +145,21 @@ function Get-GroupCache {
             throw "Unable to initialize parent group membership cache."
         }
 
-        # Check Microsoft 365 group membership and ownership directly.
-        # These endpoints return directory objects and avoid relying on the
-        # Teams conversationMember endpoint for parent-group validation.
-        $memberUri = "$GraphBase/groups/$GroupId/members"
-        $ownerUri  = "$GraphBase/groups/$GroupId/owners"
+        # Use the Team roster as the authoritative membership source.
+        # Private-channel membership requires the user to exist in this roster;
+        # group membership alone may not yet be reflected in the Team roster.
+        # Do not use $select=userId because the collection is typed as
+        # conversationMember and userId belongs to a derived member type.
+        $teamMembersUri = "$GraphBase/teams/$GroupId/members"
 
-        foreach ($entry in (Invoke-GraphGetAll -Uri $memberUri)) {
-            if ($entry.id) { [void]$members.Add([string]$entry.id) }
-        }
-        foreach ($entry in (Invoke-GraphGetAll -Uri $ownerUri)) {
-            if ($entry.id) { [void]$owners.Add([string]$entry.id) }
+        foreach ($entry in (Invoke-GraphGetAll -Uri $teamMembersUri)) {
+            if ($entry.userId) {
+                $rosterUserId = [string]$entry.userId
+                [void]$members.Add($rosterUserId)
+                if (@($entry.roles) -contains "owner") {
+                    [void]$owners.Add($rosterUserId)
+                }
+            }
         }
 
         $script:GroupCache[$key] = [pscustomobject]@{
@@ -164,7 +198,8 @@ function Get-ChannelCache {
         $script:ChannelCache[$key] = $userIds
     }
 
-    return $script:ChannelCache[$key]
+    # Preserve the HashSet object itself; do not enumerate it into strings.
+    return ,($script:ChannelCache[$key])
 }
 
 # --------------------------- Read input ---------------------------
@@ -234,33 +269,33 @@ foreach ($row in $rows) {
             $isGroupOwner  = $groupState.Owners.Contains($userId)
 
             if (-not ($isGroupMember -or $isGroupOwner)) {
-                $userReference = "$GraphBase/directoryObjects/$userId"
-
+                $teamRoles = [System.Collections.Generic.List[string]]::new()
                 if ($role -eq "Owner") {
-                    $addGroupUri = "$GraphBase/groups/$groupId/owners/`$ref"
+                    [void]$teamRoles.Add("owner")
                 }
-                else {
-                    $addGroupUri = "$GraphBase/groups/$groupId/members/`$ref"
+
+                $teamMemberBody = @{
+                    "@odata.type" = "#microsoft.graph.aadUserConversationMember"
+                    "roles" = $teamRoles
+                    "user@odata.bind" = "$GraphBase/users('$userId')"
                 }
-                $groupBody = @{ "@odata.id" = $userReference }
+                $addTeamMemberUri = "$GraphBase/teams/$groupId/members"
 
                 if ($TestMode) {
-                    $groupStatus = "TEST - Would add as $role"
-                    Write-Host "  TEST - Would add to parent group as $role (no change submitted)." -ForegroundColor Yellow
+                    $groupStatus = "TEST - Would add to Team roster as $role"
+                    Write-Host "  TEST - Would add to parent Team roster as $role (no change submitted)." -ForegroundColor Yellow
                 }
                 else {
-                    Invoke-GraphPost -Uri $addGroupUri -Body $groupBody | Out-Null
-                    $groupStatus = "Success - Added as $role"
-                    Write-Host "  SUCCESS - Added to parent group as $role." -ForegroundColor Green
+                    Invoke-GraphPost -Uri $addTeamMemberUri -Body $teamMemberBody | Out-Null
+                    $groupStatus = "Success - Added to Team roster as $role"
+                    Write-Host "  SUCCESS - Added to parent Team roster as $role." -ForegroundColor Green
                 }
 
                 # Update the in-memory state in both modes to simulate the planned
-                # membership and prevent duplicate planned additions on later rows.
+                # roster addition and prevent duplicate planned additions on later rows.
+                [void]$groupState.Members.Add($userId)
                 if ($role -eq "Owner") {
                     [void]$groupState.Owners.Add($userId)
-                }
-                else {
-                    [void]$groupState.Members.Add($userId)
                 }
             }
             else {
@@ -281,7 +316,13 @@ foreach ($row in $rows) {
                 $encodedChannelId = [System.Uri]::EscapeDataString($channelId)
                 $channelUri = "$GraphBase/teams/$groupId/channels/$encodedChannelId/members"
 
-                $channelRoles = if ($role -eq "Owner") { @("owner") } else { @() }
+                # The Graph API expects roles to be a JSON array of strings.
+                # A PowerShell one-item array can be unwrapped by an if-expression
+                # and serialized as a scalar string, which causes HTTP 400.
+                $channelRoles = [System.Collections.Generic.List[string]]::new()
+                if ($role -eq "Owner") {
+                    [void]$channelRoles.Add("owner")
+                }
 
                 $channelBody = @{
                     "@odata.type" = "#microsoft.graph.aadUserConversationMember"
@@ -295,7 +336,7 @@ foreach ($row in $rows) {
                     Write-Host "  TEST - Would add to private channel as $role (no change submitted)." -ForegroundColor Yellow
                 }
                 else {
-                    Invoke-GraphPost -Uri $channelUri -Body $channelBody | Out-Null
+                    Invoke-ChannelMemberPostWithRetry -Uri $channelUri -Body $channelBody
                     $channelStatus = "Success - Added as $role"
                     $overallStatus = "Success"
                     Write-Host "  SUCCESS - Added to private channel as $role." -ForegroundColor Green
