@@ -1,9 +1,9 @@
 ###########################################################
 ### CMD Command (Test Mode): powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\PrivateChannel_Membership_Manager.ps1" -InputPath ".\Book1(1).xlsx" -OutputPath ".\Test_Report.xlsx" -TestMode
 ### CMD Command (Prod): powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\PrivateChannel_Membership_Manager.ps1" -InputPath ".\Book1(1).xlsx" -OutputPath ".\Production_Report.xlsx"
- 
- 
- #requires -Version 5.1
+
+
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Adds users to Microsoft 365 parent groups and private Teams channels based on an Excel input file.
@@ -53,7 +53,8 @@ if (-not (Test-Path -LiteralPath $InputPath)) {
 # Delegated permissions. The signed-in operator must also have sufficient
 # Entra/Teams administrative permissions to perform these operations.
 $requiredScopes = @(
-    "TeamMember.ReadWrite.All",
+    "Group.ReadWrite.All",
+    "GroupMember.Read.All",
     "ChannelMember.ReadWrite.All"
 )
 
@@ -97,7 +98,8 @@ function Invoke-GraphPost {
 }
 
 function New-IdSet {
-    return [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    # Prevent PowerShell from enumerating an empty HashSet into $null.
+    return ,([System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase))
 }
 
 function Get-GroupCache {
@@ -109,18 +111,21 @@ function Get-GroupCache {
 
         $members = New-IdSet
         $owners  = New-IdSet
+        if ($null -eq $members -or $null -eq $owners) {
+            throw "Unable to initialize parent group membership cache."
+        }
 
-        # The Teams membership endpoint returns both team members and owners
-        # (owners are identified by the "owner" role).
-        $teamMembersUri = "$GraphBase/teams/$GroupId/members?`$select=userId,roles&`$top=100"
+        # Check Microsoft 365 group membership and ownership directly.
+        # These endpoints return directory objects and avoid relying on the
+        # Teams conversationMember endpoint for parent-group validation.
+        $memberUri = "$GraphBase/groups/$GroupId/members"
+        $ownerUri  = "$GraphBase/groups/$GroupId/owners"
 
-        foreach ($entry in (Invoke-GraphGetAll -Uri $teamMembersUri)) {
-            if ($entry.userId) {
-                [void]$members.Add([string]$entry.userId)
-                if (@($entry.roles) -contains "owner") {
-                    [void]$owners.Add([string]$entry.userId)
-                }
-            }
+        foreach ($entry in (Invoke-GraphGetAll -Uri $memberUri)) {
+            if ($entry.id) { [void]$members.Add([string]$entry.id) }
+        }
+        foreach ($entry in (Invoke-GraphGetAll -Uri $ownerUri)) {
+            if ($entry.id) { [void]$owners.Add([string]$entry.id) }
         }
 
         $script:GroupCache[$key] = [pscustomobject]@{
@@ -143,8 +148,14 @@ function Get-ChannelCache {
         Write-Host "  Reading private channel membership: $ChannelId" -ForegroundColor DarkGray
 
         $userIds = New-IdSet
+        if ($null -eq $userIds) {
+            throw "Unable to initialize private channel membership cache."
+        }
         $encodedChannelId = [System.Uri]::EscapeDataString($ChannelId)
-        $uri = "$GraphBase/teams/$GroupId/channels/$encodedChannelId/members?`$select=userId,roles&`$top=100"
+        # Do not use $select=userId here: the collection is typed as
+        # conversationMember, while userId belongs to aadUserConversationMember.
+        # Graph rejects selecting that derived-type property on the base collection.
+        $uri = "$GraphBase/teams/$GroupId/channels/$encodedChannelId/members"
 
         foreach ($entry in (Invoke-GraphGetAll -Uri $uri)) {
             if ($entry.userId) { [void]$userIds.Add([string]$entry.userId) }
@@ -223,28 +234,34 @@ foreach ($row in $rows) {
             $isGroupOwner  = $groupState.Owners.Contains($userId)
 
             if (-not ($isGroupMember -or $isGroupOwner)) {
-                $teamRoles = if ($role -eq "Owner") { @("owner") } else { @() }
-                $teamBody = @{
-                    "@odata.type" = "#microsoft.graph.aadUserConversationMember"
-                    "roles" = $teamRoles
-                    "user@odata.bind" = "$GraphBase/users('$userId')"
+                $userReference = "$GraphBase/directoryObjects/$userId"
+
+                if ($role -eq "Owner") {
+                    $addGroupUri = "$GraphBase/groups/$groupId/owners/`$ref"
                 }
-                $addTeamUri = "$GraphBase/teams/$groupId/members"
+                else {
+                    $addGroupUri = "$GraphBase/groups/$groupId/members/`$ref"
+                }
+                $groupBody = @{ "@odata.id" = $userReference }
 
                 if ($TestMode) {
                     $groupStatus = "TEST - Would add as $role"
-                    Write-Host "  TEST - Would add to parent team as $role (no change submitted)." -ForegroundColor Yellow
+                    Write-Host "  TEST - Would add to parent group as $role (no change submitted)." -ForegroundColor Yellow
                 }
                 else {
-                    Invoke-GraphPost -Uri $addTeamUri -Body $teamBody | Out-Null
+                    Invoke-GraphPost -Uri $addGroupUri -Body $groupBody | Out-Null
                     $groupStatus = "Success - Added as $role"
-                    Write-Host "  SUCCESS - Added to parent team as $role." -ForegroundColor Green
+                    Write-Host "  SUCCESS - Added to parent group as $role." -ForegroundColor Green
                 }
 
                 # Update the in-memory state in both modes to simulate the planned
                 # membership and prevent duplicate planned additions on later rows.
-                [void]$groupState.Members.Add($userId)
-                if ($role -eq "Owner") { [void]$groupState.Owners.Add($userId) }
+                if ($role -eq "Owner") {
+                    [void]$groupState.Owners.Add($userId)
+                }
+                else {
+                    [void]$groupState.Members.Add($userId)
+                }
             }
             else {
                 $existingParentRole = if ($isGroupOwner) { "Owner" } else { "Member" }
@@ -289,6 +306,9 @@ foreach ($row in $rows) {
         }
         catch {
             $errorMessage = $_.Exception.Message
+            if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+                $errorMessage = "$errorMessage | Graph details: $($_.ErrorDetails.Message)"
+            }
             $overallStatus = "Failed"
             if ($groupStatus -eq "Not processed") { $groupStatus = "Failed" }
             if ($channelStatus -eq "Not processed") { $channelStatus = "Failed" }
