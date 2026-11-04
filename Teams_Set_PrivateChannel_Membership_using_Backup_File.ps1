@@ -23,13 +23,18 @@
 .NOTES
     The script uses Microsoft Graph v1.0 and caches group/channel memberships
     to avoid repeated GET requests for rows sharing the same group or channel.
+    Large-workload optimizations include throttling-aware retries, one console result
+    line per input row, periodic progress reporting, and deferred Excel report export.
 #>
 
 [CmdletBinding()]
 param(
     [string]$InputPath  = ".\Book1(1).xlsx",
     [string]$OutputPath = ".\PrivateChannel_Membership_Report.xlsx",
-    [switch]$TestMode
+    [switch]$TestMode,
+    [ValidateRange(10, 5000)]
+    [int]$ProgressIntervalRows = 100,
+    [switch]$DetailedOutput
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,6 +75,91 @@ Connect-MgGraph -Scopes $requiredScopes -NoWelcome
 
 # --------------------------- Helper functions ---------------------------
 
+function Get-GraphHttpStatusCode {
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $exception = $ErrorRecord.Exception
+    foreach ($candidate in @(
+        $(if ($null -ne $exception.Response) { $exception.Response.StatusCode }),
+        $(if ($null -ne $exception.InnerException -and $null -ne $exception.InnerException.Response) { $exception.InnerException.Response.StatusCode })
+    )) {
+        if ($null -ne $candidate) {
+            try { return [int]$candidate } catch { }
+        }
+    }
+
+    $message = [string]$exception.Message
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        $message += " " + $ErrorRecord.ErrorDetails.Message
+    }
+    if ($message -match '(?<!\d)(429|503|504|408)(?!\d)') { return [int]$Matches[1] }
+    return 0
+}
+
+function Get-GraphRetryDelaySeconds {
+    param(
+        [Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory)][int]$Attempt
+    )
+
+    # Honor Retry-After whenever the Graph/HTTP response exposes it.
+    try {
+        $headers = $ErrorRecord.Exception.Response.Headers
+        if ($null -ne $headers) {
+            $retryAfter = $headers['Retry-After']
+            if ($retryAfter) {
+                $seconds = 0
+                if ([int]::TryParse([string]$retryAfter, [ref]$seconds) -and $seconds -ge 0) {
+                    return [Math]::Min($seconds, 120)
+                }
+            }
+        }
+    } catch { }
+
+    try {
+        $delta = $ErrorRecord.Exception.Response.Headers.RetryAfter.Delta
+        if ($null -ne $delta) { return [Math]::Min([Math]::Max(0, [int][Math]::Ceiling($delta.TotalSeconds)), 120) }
+    } catch { }
+
+    # Fallback exponential backoff with a cap to avoid rapid retry loops.
+    return [Math]::Min([int][Math]::Pow(2, $Attempt), 60)
+}
+
+function Invoke-GraphRequestWithRetry {
+    param(
+        [Parameter(Mandatory)][ValidateSet('GET','POST')][string]$Method,
+        [Parameter(Mandatory)][string]$Uri,
+        [object]$Body,
+        [int]$MaxAttempts = 6
+    )
+
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            if ($Method -eq 'GET') {
+                return Invoke-MgGraphRequest -Method GET -Uri $Uri -OutputType PSObject
+            }
+            $json = $Body | ConvertTo-Json -Depth 8
+            return Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $json -ContentType 'application/json' -OutputType PSObject
+        }
+        catch {
+            $statusCode = Get-GraphHttpStatusCode -ErrorRecord $_
+            $isTransientHttpError = $statusCode -in @(408, 429, 503, 504)
+
+            # Retry only explicit transient HTTP responses. A transport failure with
+            # an unknown outcome is not blindly retried for POST to avoid duplicates.
+            if ($isTransientHttpError -and $attempt -lt $MaxAttempts) {
+                $delay = Get-GraphRetryDelaySeconds -ErrorRecord $_ -Attempt $attempt
+                if ($DetailedOutput) {
+                    Write-Host "  INFO - Graph returned HTTP $statusCode. Retrying in $delay second(s) ($attempt/$MaxAttempts)..." -ForegroundColor Yellow
+                }
+                Start-Sleep -Seconds $delay
+                continue
+            }
+            throw
+        }
+    }
+}
+
 function Invoke-GraphGetAll {
     param([Parameter(Mandatory)][string]$Uri)
 
@@ -77,7 +167,7 @@ function Invoke-GraphGetAll {
     $nextUri = $Uri
 
     while ($nextUri) {
-        $response = Invoke-MgGraphRequest -Method GET -Uri $nextUri -OutputType PSObject
+        $response = Invoke-GraphRequestWithRetry -Method GET -Uri $nextUri
         if ($null -ne $response.value) {
             foreach ($item in $response.value) { $items.Add($item) }
         }
@@ -93,8 +183,7 @@ function Invoke-GraphPost {
         [Parameter(Mandatory)][object]$Body
     )
 
-    $json = $Body | ConvertTo-Json -Depth 8
-    Invoke-MgGraphRequest -Method POST -Uri $Uri -Body $json -ContentType "application/json" -OutputType PSObject
+    Invoke-GraphRequestWithRetry -Method POST -Uri $Uri -Body $Body | Out-Null
 }
 
 function Invoke-ChannelMemberPostWithRetry {
@@ -117,7 +206,7 @@ function Invoke-ChannelMemberPostWithRetry {
 
             $isRosterPropagationError = $errorText -match "UserNotFoundInTeamRoster|not part of the parent team roster"
             if ($isRosterPropagationError -and $attempt -lt $MaxAttempts) {
-                Write-Host "  INFO - Team roster update is still propagating. Retrying channel addition ($attempt/$MaxAttempts)..." -ForegroundColor Yellow
+                if ($DetailedOutput) { Write-Host "  INFO - Team roster update is still propagating. Retrying channel addition ($attempt/$MaxAttempts)..." -ForegroundColor Yellow }
                 Start-Sleep -Seconds 3
                 continue
             }
@@ -137,7 +226,7 @@ function Get-GroupCache {
 
     $key = $GroupId.ToLowerInvariant()
     if (-not $script:GroupCache.ContainsKey($key)) {
-        Write-Host "  Reading parent group membership: $GroupId" -ForegroundColor DarkGray
+        if ($DetailedOutput) { Write-Host "  Reading parent group membership: $GroupId" -ForegroundColor DarkGray }
 
         $members = New-IdSet
         $owners  = New-IdSet
@@ -179,7 +268,7 @@ function Get-ChannelCache {
 
     $key = ($GroupId + "|" + $ChannelId).ToLowerInvariant()
     if (-not $script:ChannelCache.ContainsKey($key)) {
-        Write-Host "  Reading private channel membership: $ChannelId" -ForegroundColor DarkGray
+        if ($DetailedOutput) { Write-Host "  Reading private channel membership: $ChannelId" -ForegroundColor DarkGray }
 
         $userIds = New-IdSet
         if ($null -eq $userIds) {
@@ -223,9 +312,15 @@ if ($missingColumns.Count -gt 0) {
 $script:GroupCache = @{}
 $script:ChannelCache = @{}
 $report = [System.Collections.Generic.List[object]]::new()
+$successCount = 0
+$testCount = 0
+$failedCount = 0
+$skippedCount = 0
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 Write-Host ""
 Write-Host "Starting membership processing for $($rows.Count) row(s)..." -ForegroundColor Cyan
+Write-Host "A result line will be displayed for every processed row. The Excel report is generated only after all rows finish."
 Write-Host ""
 
 # --------------------------- Main processing ---------------------------
@@ -249,17 +344,17 @@ foreach ($row in $rows) {
     $overallStatus = "Skipped"
     $details = ""
 
-    Write-Host "[$rowNumber/$($rows.Count + 1)] $displayName <$userEmail>" -ForegroundColor White
+    if ($DetailedOutput) { Write-Host "[$rowNumber/$($rows.Count + 1)] $displayName <$userEmail>" -ForegroundColor White }
 
     # Treat a partially completed row as invalid; do not guess missing values.
     $values = @($groupName, $groupId, $channelName, $channelId, $displayName, $userId, $userEmail, $role)
     if (@($values | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
         $details = "Skipped: one or more required cells are blank."
-        Write-Host "  SKIPPED - Missing required information." -ForegroundColor Yellow
+        if ($DetailedOutput) { Write-Host "  SKIPPED - Missing required information." -ForegroundColor Yellow }
     }
     elseif ($role -notin @("Member", "Owner")) {
         $details = "Skipped: Role must be 'Member' or 'Owner'."
-        Write-Host "  SKIPPED - Invalid Role '$role'." -ForegroundColor Yellow
+        if ($DetailedOutput) { Write-Host "  SKIPPED - Invalid Role '$role'." -ForegroundColor Yellow }
     }
     else {
         try {
@@ -283,12 +378,12 @@ foreach ($row in $rows) {
 
                 if ($TestMode) {
                     $groupStatus = "TEST - Would add to Team roster as $role"
-                    Write-Host "  TEST - Would add to parent Team roster as $role (no change submitted)." -ForegroundColor Yellow
+                    if ($DetailedOutput) { Write-Host "  TEST - Would add to parent Team roster as $role (no change submitted)." -ForegroundColor Yellow }
                 }
                 else {
                     Invoke-GraphPost -Uri $addTeamMemberUri -Body $teamMemberBody | Out-Null
                     $groupStatus = "Success - Added to Team roster as $role"
-                    Write-Host "  SUCCESS - Added to parent Team roster as $role." -ForegroundColor Green
+                    if ($DetailedOutput) { Write-Host "  SUCCESS - Added to parent Team roster as $role." -ForegroundColor Green }
                 }
 
                 # Update the in-memory state in both modes to simulate the planned
@@ -301,7 +396,7 @@ foreach ($row in $rows) {
             else {
                 $existingParentRole = if ($isGroupOwner) { "Owner" } else { "Member" }
                 $groupStatus = "Already present as $existingParentRole"
-                Write-Host "  INFO - Already present in parent group ($existingParentRole)." -ForegroundColor DarkCyan
+                if ($DetailedOutput) { Write-Host "  INFO - Already present in parent group ($existingParentRole)." -ForegroundColor DarkCyan }
             }
 
             # Only attempt channel membership after parent-group membership is confirmed.
@@ -310,7 +405,7 @@ foreach ($row in $rows) {
             if ($channelUsers.Contains($userId)) {
                 $channelStatus = "Already present - No change"
                 $overallStatus = "Skipped"
-                Write-Host "  SKIPPED - Already present in private channel; existing role preserved." -ForegroundColor Yellow
+                if ($DetailedOutput) { Write-Host "  SKIPPED - Already present in private channel; existing role preserved." -ForegroundColor Yellow }
             }
             else {
                 $encodedChannelId = [System.Uri]::EscapeDataString($channelId)
@@ -333,13 +428,13 @@ foreach ($row in $rows) {
                 if ($TestMode) {
                     $channelStatus = "TEST - Would add as $role"
                     $overallStatus = "Test - Would add"
-                    Write-Host "  TEST - Would add to private channel as $role (no change submitted)." -ForegroundColor Yellow
+                    if ($DetailedOutput) { Write-Host "  TEST - Would add to private channel as $role (no change submitted)." -ForegroundColor Yellow }
                 }
                 else {
                     Invoke-ChannelMemberPostWithRetry -Uri $channelUri -Body $channelBody
                     $channelStatus = "Success - Added as $role"
                     $overallStatus = "Success"
-                    Write-Host "  SUCCESS - Added to private channel as $role." -ForegroundColor Green
+                    if ($DetailedOutput) { Write-Host "  SUCCESS - Added to private channel as $role." -ForegroundColor Green }
                 }
 
                 [void]$channelUsers.Add($userId)
@@ -373,14 +468,45 @@ foreach ($row in $rows) {
         "Details" = $details
         "Processed At" = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
     })
+
+    switch ($overallStatus) {
+        'Success' { $successCount++ }
+        'Test - Would add' { $testCount++ }
+        'Failed' { $failedCount++ }
+        'Skipped' { $skippedCount++ }
+    }
+
+    # Always emit exactly one concise completion line for each input row.
+    # DetailedOutput may additionally show the individual Graph/cache operations.
+    $rowResult = "[{0}/{1}] {2} | {3} <{4}> | Team: {5} | Channel: {6}" -f `
+        $report.Count, $rows.Count, $overallStatus, $displayName, $userEmail, $groupStatus, $channelStatus
+    $rowColor = switch ($overallStatus) {
+        'Success' { 'Green' }
+        'Test - Would add' { 'Yellow' }
+        'Failed' { 'Red' }
+        default { 'DarkGray' }
+    }
+    Write-Host $rowResult -ForegroundColor $rowColor
+
+    if (($report.Count % $ProgressIntervalRows) -eq 0 -or $report.Count -eq $rows.Count) {
+        $percentComplete = [int](($report.Count / $rows.Count) * 100)
+        $elapsed = $stopwatch.Elapsed
+        $rate = if ($elapsed.TotalSeconds -gt 0) { [Math]::Round($report.Count / $elapsed.TotalSeconds, 1) } else { 0 }
+        Write-Progress -Activity 'Processing Teams private-channel memberships' `
+            -Status "$($report.Count)/$($rows.Count) rows | $percentComplete% | $rate rows/sec | $($elapsed.ToString('hh\:mm\:ss')) elapsed" `
+            -PercentComplete $percentComplete
+        Write-Host ("Progress: {0}/{1} ({2}%) | {3} rows/sec | Failed: {4}" -f $report.Count, $rows.Count, $percentComplete, $rate, $failedCount)
+    }
 }
 
-# --------------------------- Export report ---------------------------
+Write-Progress -Activity 'Processing Teams private-channel memberships' -Completed
+$stopwatch.Stop()
 
-$successCount = @($report | Where-Object { $_.'Overall Status' -eq "Success" }).Count
-$testCount    = @($report | Where-Object { $_.'Overall Status' -eq "Test - Would add" }).Count
-$failedCount  = @($report | Where-Object { $_.'Overall Status' -eq "Failed" }).Count
-$skippedCount = @($report | Where-Object { $_.'Overall Status' -eq "Skipped" }).Count
+# No report file is written during row processing. Export starts only after the
+# complete input worksheet has been processed.
+Write-Host "All $($rows.Count) input row(s) processed. Generating the final Excel report..." -ForegroundColor Cyan
+
+# --------------------------- Export report ---------------------------
 
 $summary = @(
     [pscustomobject]@{ Metric = "Execution Mode"; Value = $(if ($TestMode) { "TEST - No changes submitted" } else { "LIVE - Changes applied" }) }
@@ -389,6 +515,10 @@ $summary = @(
     [pscustomobject]@{ Metric = "Planned Channel Additions (Test Mode)"; Value = $testCount }
     [pscustomobject]@{ Metric = "Failed Rows"; Value = $failedCount }
     [pscustomobject]@{ Metric = "Skipped Rows"; Value = $skippedCount }
+    [pscustomobject]@{ Metric = "Processing Duration"; Value = $stopwatch.Elapsed.ToString("hh\:mm\:ss") }
+    [pscustomobject]@{ Metric = "Average Processing Rate (rows/sec)"; Value = $(if ($stopwatch.Elapsed.TotalSeconds -gt 0) { [Math]::Round($report.Count / $stopwatch.Elapsed.TotalSeconds, 2) } else { 0 }) }
+    [pscustomobject]@{ Metric = "Unique Teams Cached"; Value = $script:GroupCache.Count }
+    [pscustomobject]@{ Metric = "Unique Private Channels Cached"; Value = $script:ChannelCache.Count }
     [pscustomobject]@{ Metric = "Report Generated"; Value = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") }
 )
 
@@ -396,12 +526,17 @@ if (Test-Path -LiteralPath $OutputPath) {
     Remove-Item -LiteralPath $OutputPath -Force
 }
 
-$report | Export-Excel -Path $OutputPath -WorksheetName "Details" -TableName "MembershipResults" -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow
-$summary | Export-Excel -Path $OutputPath -WorksheetName "Summary" -TableName "ExecutionSummary" -AutoSize -AutoFilter -FreezeTopRow -BoldTopRow -Append
+# AutoSize is intentionally omitted: scanning 20k+ rows to calculate every
+# column width can dominate report-generation time. Excel remains filterable.
+$report | Export-Excel -Path $OutputPath -WorksheetName "Details" -TableName "MembershipResults" -AutoFilter -FreezeTopRow -BoldTopRow
+$summary | Export-Excel -Path $OutputPath -WorksheetName "Summary" -TableName "ExecutionSummary" -AutoFilter -FreezeTopRow -BoldTopRow -Append
 
 Write-Host ""
 Write-Host "==================== EXECUTION SUMMARY ====================" -ForegroundColor Cyan
 Write-Host "Total rows:                 $($report.Count)"
+Write-Host "Processing duration:        $($stopwatch.Elapsed.ToString('hh\:mm\:ss'))"
+Write-Host "Unique Teams cached:         $($script:GroupCache.Count)"
+Write-Host "Unique channels cached:      $($script:ChannelCache.Count)"
 Write-Host "Successful channel adds:    $successCount" -ForegroundColor Green
 Write-Host "Planned channel adds:       $testCount" -ForegroundColor Yellow
 Write-Host "Failed rows:                $failedCount" -ForegroundColor Red
