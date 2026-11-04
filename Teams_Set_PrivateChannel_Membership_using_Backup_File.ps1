@@ -1,4 +1,9 @@
-﻿#requires -Version 5.1
+###########################################################
+### CMD Command (Test Mode): powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\PrivateChannel_Membership_Manager.ps1" -InputPath ".\Book1(1).xlsx" -OutputPath ".\Test_Report.xlsx" -TestMode
+### CMD Command (Prod): powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\PrivateChannel_Membership_Manager.ps1" -InputPath ".\Book1(1).xlsx" -OutputPath ".\Production_Report.xlsx"
+ 
+ 
+ #requires -Version 5.1
 <#
 .SYNOPSIS
     Adds users to Microsoft 365 parent groups and private Teams channels based on an Excel input file.
